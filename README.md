@@ -1,7 +1,11 @@
 # Resource Widget
 
-A tiny always-on-top Windows desktop widget showing live RAM and Disk usage.
-No installer — it's a single portable `.exe`.
+A polished, always-on-top Windows desktop dashboard showing live **CPU**,
+**RAM**, **GPU** (NVIDIA — usage, VRAM, temperature) and **Disk** usage, plus
+a rolling CPU history sparkline. No installer — it's a single portable `.exe`.
+
+If no NVIDIA GPU / driver is found, the GPU row shows "No GPU detected"
+instead of failing — the rest of the widget keeps working normally.
 
 ![status](https://img.shields.io/badge/build-GitHub%20Actions-blue)
 
@@ -39,10 +43,13 @@ straight from the repo's **Releases** page.
 ## Running the widget
 
 Download `ResourceWidget.exe` and double-click it. It opens as a small
-borderless panel with live RAM and Disk (`C:`) usage bars that shift from
-green → orange → red as usage climbs.
+borderless dashboard card showing CPU, RAM, GPU and Disk (`C:`), each with a
+progress bar that shifts from green → orange → red as usage climbs, plus a
+live CPU history sparkline at the bottom.
 
 - Drag it anywhere by clicking and holding on the panel.
+- Click **—** to collapse it down to just the header bar; click again to
+  expand.
 - Click the small **✕** in the top-right corner to close it.
 
 ### Run it automatically at Windows startup (optional)

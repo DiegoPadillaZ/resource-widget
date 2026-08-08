@@ -1,12 +1,13 @@
 @echo off
 REM Run this on a Windows machine, in the same folder as resource_widget.py
-REM It installs the two needed packages and builds a single portable .exe.
+REM It installs the needed packages and builds a single portable .exe.
 
 echo Installing dependencies...
-pip install psutil pyinstaller
+pip install -r requirements.txt
+pip install pyinstaller
 
 echo Building ResourceWidget.exe ...
-pyinstaller --onefile --noconsole --name ResourceWidget resource_widget.py
+pyinstaller --onefile --noconsole --name ResourceWidget --hidden-import pynvml resource_widget.py
 
 echo.
 echo Done. Your exe is in the "dist" folder: dist\ResourceWidget.exe
