@@ -9,34 +9,76 @@ Build (see README.md / GitHub Actions workflow for the automated version):
     pyinstaller --onefile --noconsole --name ResourceWidget resource_widget.py
 """
 
+import os
 import sys
+import json
 import collections
 import tkinter as tk
+from tkinter import Menu
 import psutil
 
 # ---------------------------------------------------------------------------
+# Windows DPI awareness - without this, tkinter renders blurry / mis-scaled
+# on high-DPI displays because Windows silently bitmap-scales the whole app.
+# ---------------------------------------------------------------------------
+if sys.platform.startswith("win"):
+    try:
+        import ctypes
+        try:
+            # Per-monitor DPI awareness (Windows 8.1+)
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            # Fallback for older Windows versions
+            ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
 # Optional NVIDIA GPU support. Falls back gracefully if unavailable
-# (no NVIDIA GPU, driver missing, or pynvml not installed).
+# (no NVIDIA GPU, driver missing, or pynvml not installed). Init is retried
+# lazily in case the driver/service isn't ready yet at process start.
 # ---------------------------------------------------------------------------
 GPU_AVAILABLE = False
 _gpu_handle = None
+_gpu_name = "No GPU detected"
+_gpu_init_attempted = False
+
 try:
     import pynvml
-
-    pynvml.nvmlInit()
-    _gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
-    _gpu_name = pynvml.nvmlDeviceGetName(_gpu_handle)
-    if isinstance(_gpu_name, bytes):
-        _gpu_name = _gpu_name.decode("utf-8", "ignore")
-    GPU_AVAILABLE = True
 except Exception:
-    GPU_AVAILABLE = False
-    _gpu_name = "No GPU detected"
+    pynvml = None
+
+
+def _try_init_gpu():
+    """Attempt (or retry) NVML init. Safe to call repeatedly."""
+    global GPU_AVAILABLE, _gpu_handle, _gpu_name, _gpu_init_attempted
+    if GPU_AVAILABLE or pynvml is None:
+        return
+    try:
+        pynvml.nvmlInit()
+        _gpu_handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+        name = pynvml.nvmlDeviceGetName(_gpu_handle)
+        if isinstance(name, bytes):
+            name = name.decode("utf-8", "ignore")
+        _gpu_name = name
+        GPU_AVAILABLE = True
+    except Exception:
+        GPU_AVAILABLE = False
+        if not _gpu_init_attempted:
+            _gpu_name = "No GPU detected"
+    finally:
+        _gpu_init_attempted = True
+
+
+_try_init_gpu()
 
 
 def read_gpu():
     """Returns (usage_pct, vram_used_gb, vram_total_gb, temp_c) or None."""
     if not GPU_AVAILABLE:
+        # Retry occasionally in case the driver becomes available later
+        # (e.g. after a driver update / hot-plug docking station GPU).
+        _try_init_gpu()
         return None
     try:
         util = pynvml.nvmlDeviceGetUtilizationRates(_gpu_handle)
@@ -52,6 +94,13 @@ def read_gpu():
         return None
 
 
+def _default_disk_path():
+    """Use the actual system drive instead of assuming C:\\."""
+    if sys.platform.startswith("win"):
+        return os.environ.get("SystemDrive", "C:") + "\\"
+    return "/"
+
+
 # ---------------------------------------------------------------------------
 # Config / theme
 # ---------------------------------------------------------------------------
@@ -59,7 +108,7 @@ WIDTH = 260
 HEIGHT_FULL = 388
 HEIGHT_COLLAPSED = 46
 UPDATE_MS = 1200
-DISK_PATH = "C:\\" if sys.platform.startswith("win") else "/"
+DISK_PATH = _default_disk_path()
 HISTORY_LEN = 40
 
 BG = "#0f1115"
@@ -78,6 +127,49 @@ WARN = "#ffcc4d"
 DANGER = "#ff5c6c"
 
 BAR_TRACK = "#262b36"
+
+# ---------------------------------------------------------------------------
+# Settings persistence (window position, collapsed state, opacity, pin state)
+# ---------------------------------------------------------------------------
+def _config_path():
+    base = os.environ.get("APPDATA") if sys.platform.startswith("win") else os.path.expanduser("~")
+    cfg_dir = os.path.join(base, "ResourceWidget") if base else os.path.expanduser("~")
+    try:
+        os.makedirs(cfg_dir, exist_ok=True)
+    except Exception:
+        pass
+    return os.path.join(cfg_dir, "settings.json")
+
+
+DEFAULT_SETTINGS = {
+    "x": 80,
+    "y": 80,
+    "collapsed": False,
+    "opacity": 0.97,
+    "always_on_top": True,
+}
+
+
+def load_settings():
+    path = _config_path()
+    settings = dict(DEFAULT_SETTINGS)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            saved = json.load(f)
+        if isinstance(saved, dict):
+            settings.update({k: v for k, v in saved.items() if k in DEFAULT_SETTINGS})
+    except Exception:
+        pass
+    return settings
+
+
+def save_settings(settings):
+    path = _config_path()
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(settings, f)
+    except Exception:
+        pass
 
 
 def status_color(pct, accent):
@@ -157,24 +249,45 @@ class ResourceWidget(tk.Tk):
     def __init__(self):
         super().__init__()
 
+        self.settings = load_settings()
+
         self.overrideredirect(True)
-        self.attributes("-topmost", True)
+        self.attributes("-topmost", bool(self.settings.get("always_on_top", True)))
         try:
-            self.attributes("-alpha", 0.97)
-        except tk.TclError:
+            self.attributes("-alpha", float(self.settings.get("opacity", 0.97)))
+        except (tk.TclError, TypeError, ValueError):
             pass
 
-        self.collapsed = False
-        self.geometry(f"{WIDTH}x{HEIGHT_FULL}+80+80")
+        self.collapsed = bool(self.settings.get("collapsed", False))
+        start_h = HEIGHT_COLLAPSED if self.collapsed else HEIGHT_FULL
+        x = self._clamp_to_screen(int(self.settings.get("x", 80)),
+                                   int(self.settings.get("y", 80)))
+        self.geometry(f"{WIDTH}x{start_h}+{x[0]}+{x[1]}")
         self.config(bg=BG)
 
         self._offset_x = 0
         self._offset_y = 0
+        self._dragging = False
         self.cpu_history = collections.deque([0] * HISTORY_LEN, maxlen=HISTORY_LEN)
 
         self._build_ui()
         self._bind_drag()
+        self._bind_context_menu()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._tick()
+
+    # ------------------------------------------------------------------
+    def _clamp_to_screen(self, x, y):
+        """Keep the widget's saved position on-screen even if it was last
+        closed on a monitor that's no longer connected."""
+        try:
+            sw = self.winfo_screenwidth()
+            sh = self.winfo_screenheight()
+        except Exception:
+            return x, y
+        x = max(0, min(x, max(sw - WIDTH, 0)))
+        y = max(0, min(y, max(sh - HEIGHT_COLLAPSED, 0)))
+        return x, y
 
     # ------------------------------------------------------------------
     def _build_ui(self):
@@ -197,11 +310,11 @@ class ResourceWidget(tk.Tk):
 
         self.min_btn = c.create_text(WIDTH - 40, 12, anchor="e", text="—",
                                       fill=SUBTEXT, font=("Segoe UI", 10, "bold"))
-        c.tag_bind(self.min_btn, "<Button-1>", lambda e: self._toggle_collapse())
+        c.tag_bind(self.min_btn, "<Button-1>", self._on_minimize_click)
 
         self.close_btn = c.create_text(WIDTH - 16, 12, anchor="e", text="✕",
                                         fill=SUBTEXT, font=("Segoe UI", 10, "bold"))
-        c.tag_bind(self.close_btn, "<Button-1>", lambda e: self.destroy())
+        c.tag_bind(self.close_btn, "<Button-1>", lambda e: self._on_close())
 
         c.create_line(0, 34, WIDTH, 34, fill=BORDER)
 
@@ -232,12 +345,17 @@ class ResourceWidget(tk.Tk):
             self.gpu_row.update(0, _gpu_name[:28])
 
     # ------------------------------------------------------------------
+    def _on_minimize_click(self, event):
+        self._toggle_collapse()
+
     def _toggle_collapse(self):
         self.collapsed = not self.collapsed
         new_h = HEIGHT_COLLAPSED if self.collapsed else HEIGHT_FULL
         self.geometry(f"{WIDTH}x{new_h}")
         self.canvas.config(height=new_h)
         self._redraw_card_height(new_h)
+        self.settings["collapsed"] = self.collapsed
+        save_settings(self.settings)
 
     def _redraw_card_height(self, h):
         # Simplest robust approach: fully redraw static chrome sized to h.
@@ -251,10 +369,10 @@ class ResourceWidget(tk.Tk):
                           font=("Segoe UI", 9, "bold"))
             self.min_btn = c.create_text(WIDTH - 40, 12, anchor="e", text="▢",
                                           fill=SUBTEXT, font=("Segoe UI", 10, "bold"))
-            c.tag_bind(self.min_btn, "<Button-1>", lambda e: self._toggle_collapse())
+            c.tag_bind(self.min_btn, "<Button-1>", self._on_minimize_click)
             self.close_btn = c.create_text(WIDTH - 16, 12, anchor="e", text="✕",
                                             fill=SUBTEXT, font=("Segoe UI", 10, "bold"))
-            c.tag_bind(self.close_btn, "<Button-1>", lambda e: self.destroy())
+            c.tag_bind(self.close_btn, "<Button-1>", lambda e: self._on_close())
         else:
             self._draw_static()
 
@@ -262,15 +380,82 @@ class ResourceWidget(tk.Tk):
     def _bind_drag(self):
         self.canvas.bind("<Button-1>", self._start_drag)
         self.canvas.bind("<B1-Motion>", self._on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self._end_drag)
 
     def _start_drag(self, event):
+        # Don't start a drag if the click landed on the min/close buttons -
+        # previously both the button's own binding AND the canvas-wide drag
+        # binding fired together, causing jumpy clicks near the header.
+        clicked = self.canvas.find_withtag("current")
+        if clicked and clicked[0] in (self.min_btn, self.close_btn):
+            self._dragging = False
+            return
+        self._dragging = True
         self._offset_x = event.x
         self._offset_y = event.y
 
     def _on_drag(self, event):
+        if not self._dragging:
+            return
         x = self.winfo_pointerx() - self._offset_x
         y = self.winfo_pointery() - self._offset_y
         self.geometry(f"+{x}+{y}")
+
+    def _end_drag(self, event):
+        if self._dragging:
+            self.settings["x"] = self.winfo_x()
+            self.settings["y"] = self.winfo_y()
+            save_settings(self.settings)
+        self._dragging = False
+
+    # ------------------------------------------------------------------
+    def _bind_context_menu(self):
+        self.menu = Menu(self, tearoff=0, bg=CARD, fg=TEXT, activebackground=ROW_BG,
+                          activeforeground=TEXT, bd=0)
+        self._pin_var = tk.BooleanVar(value=bool(self.settings.get("always_on_top", True)))
+        self.menu.add_checkbutton(label="Always on top", variable=self._pin_var,
+                                   command=self._toggle_pin)
+        self.menu.add_command(label="Opacity 100%", command=lambda: self._set_opacity(1.0))
+        self.menu.add_command(label="Opacity 90%", command=lambda: self._set_opacity(0.90))
+        self.menu.add_command(label="Opacity 75%", command=lambda: self._set_opacity(0.75))
+        self.menu.add_separator()
+        self.menu.add_command(label="Reset position", command=self._reset_position)
+        self.menu.add_separator()
+        self.menu.add_command(label="Quit", command=self._on_close)
+        self.canvas.bind("<Button-3>", self._show_context_menu)
+
+    def _show_context_menu(self, event):
+        try:
+            self.menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            self.menu.grab_release()
+
+    def _toggle_pin(self):
+        pinned = self._pin_var.get()
+        self.attributes("-topmost", pinned)
+        self.settings["always_on_top"] = pinned
+        save_settings(self.settings)
+
+    def _set_opacity(self, value):
+        try:
+            self.attributes("-alpha", value)
+            self.settings["opacity"] = value
+            save_settings(self.settings)
+        except tk.TclError:
+            pass
+
+    def _reset_position(self):
+        self.geometry(f"{WIDTH}x{HEIGHT_COLLAPSED if self.collapsed else HEIGHT_FULL}+80+80")
+        self.settings["x"] = 80
+        self.settings["y"] = 80
+        save_settings(self.settings)
+
+    def _on_close(self):
+        self.settings["x"] = self.winfo_x()
+        self.settings["y"] = self.winfo_y()
+        self.settings["collapsed"] = self.collapsed
+        save_settings(self.settings)
+        self.destroy()
 
     # ------------------------------------------------------------------
     def _update_sparkline(self):
@@ -302,8 +487,12 @@ class ResourceWidget(tk.Tk):
         try:
             cpu_pct = psutil.cpu_percent(interval=None)
             ram = psutil.virtual_memory()
-            disk = psutil.disk_usage(DISK_PATH)
             gpu = read_gpu()
+
+            try:
+                disk = psutil.disk_usage(DISK_PATH)
+            except Exception:
+                disk = None
 
             self.cpu_history.append(cpu_pct)
 
@@ -322,9 +511,12 @@ class ResourceWidget(tk.Tk):
                 else:
                     self.gpu_row.update(0, _gpu_name[:28] if not GPU_AVAILABLE else "read error")
 
-                dused_gb = disk.used / (1024 ** 3)
-                dtotal_gb = disk.total / (1024 ** 3)
-                self.disk_row.update(disk.percent, f"{dused_gb:.0f} / {dtotal_gb:.0f} GB ({DISK_PATH})")
+                if disk is not None:
+                    dused_gb = disk.used / (1024 ** 3)
+                    dtotal_gb = disk.total / (1024 ** 3)
+                    self.disk_row.update(disk.percent, f"{dused_gb:.0f} / {dtotal_gb:.0f} GB ({DISK_PATH})")
+                else:
+                    self.disk_row.update(0, "unavailable")
 
                 self._update_sparkline()
         except Exception:
